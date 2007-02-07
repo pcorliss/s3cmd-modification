@@ -1,0 +1,343 @@
+#!/usr/bin/env python
+
+## Amazon S3 manager
+## Author: Michal Ludvig <michal@logix.cz>
+##         http://www.logix.cz/michal
+## License: GPL Version 2
+
+import sys
+import logging
+import time
+
+from copy import copy
+from optparse import OptionParser, Option, OptionValueError, IndentedHelpFormatter
+from logging import debug, info, warning, error
+import elementtree.ElementTree as ET
+
+## Our modules
+from S3.S3 import *
+from S3.Config import Config
+from S3.S3Uri import *
+
+def output(message):
+	print message
+
+def cmd_ls(args):
+	s3 = S3(Config())
+	if len(args) > 0:
+		uri = S3Uri(args[0])
+		if uri.type == "s3" and uri.has_bucket():
+			subcmd_bucket_list(s3, uri)
+			return
+	subcmd_buckets_list_all(s3)
+
+def cmd_buckets_list_all_all(args):
+	s3 = S3(Config())
+
+	response = s3.list_all_buckets()
+
+	for bucket in response["list"]:
+		subcmd_bucket_list(s3, S3Uri("s3://" + bucket["Name"]))
+		output("")
+
+
+def subcmd_buckets_list_all(s3):
+	response = s3.list_all_buckets()
+	for bucket in response["list"]:
+		output("%s  s3://%s" % (
+			formatDateTime(bucket["CreationDate"]),
+			bucket["Name"],
+			))
+
+def subcmd_bucket_list(s3, uri):
+	bucket = uri.bucket()
+	object = uri.object()
+
+	output("Bucket '%s':" % bucket)
+	if object.endswith('*'):
+		object = object[:-1]
+	try:
+		response = s3.bucket_list(bucket, prefix = object)
+	except S3Error, e:
+		if S3.codes.has_key(e.Code):
+			error(S3.codes[e.Code] % bucket)
+			return
+		else:
+			raise
+	for object in response["list"]:
+		size, size_coeff = formatSize(object["Size"], Config().human_readable_sizes)
+		output("%s  %s%s  %s" % (
+			formatDateTime(object["LastModified"]),
+			str(size).rjust(8), size_coeff.ljust(1),
+			uri.compose_uri(bucket, object["Key"]),
+			))
+
+def cmd_bucket_create(args):
+	uri = S3Uri(args[0])
+	if not uri.type == "s3" or not uri.has_bucket() or uri.has_object():
+		raise ParameterError("Expecting S3 URI with just the bucket name set instead of '%s'" % args[0])
+
+	try:
+		s3 = S3(Config())
+		response = s3.bucket_create(uri.bucket())
+	except S3Error, e:
+		if S3.codes.has_key(e.Code):
+			error(S3.codes[e.Code] % uri.bucket())
+			return
+		else:
+			raise
+	output("Bucket '%s' created" % uri.bucket())
+
+def cmd_bucket_delete(args):
+	uri = S3Uri(args[0])
+	if not uri.type == "s3" or not uri.has_bucket() or uri.has_object():
+		raise ParameterError("Expecting S3 URI with just the bucket name set instead of '%s'" % args[0])
+	try:
+		s3 = S3(Config())
+		response = s3.bucket_delete(uri.bucket())
+	except S3Error, e:
+		if S3.codes.has_key(e.Code):
+			error(S3.codes[e.Code] % uri.bucket())
+			return
+		else:
+			raise
+	output("Bucket '%s' removed" % uri.bucket())
+
+def cmd_object_put(args):
+	s3 = S3(Config())
+
+	uri_arg = args.pop()
+	files = args[:]
+
+	uri = S3Uri(uri_arg)
+	if uri.type != "s3":
+		raise ParameterError("Expecting S3 URI instead of '%s'" % uri_arg)
+
+	if len(files) > 1 and uri.object != "" and not Config().force:
+		error("When uploading multiple files the last argument must")
+		error("be a S3 URI specifying just the bucket name")
+		error("WITHOUT object name!")
+		error("Alternatively use --force argument and the specified")
+		error("object name will be prefixed to all stored filenames.")
+		sys.exit(1)
+
+	for file in files:
+		uri_arg_final = str(uri)
+		if len(files) > 1 or uri.object() == "":
+			uri_arg_final += os.path.basename(file)
+
+		uri_final = S3Uri(uri_arg_final)
+		response = s3.object_put_uri(file, uri_final)
+		output("File '%s' stored as %s (%d bytes)" %
+			(file, uri_final, response["size"]))
+
+def cmd_object_get(args):
+	s3 = S3(Config())
+
+	uri_arg = args.pop(0)
+	uri = S3Uri(uri_arg)
+	if uri.type != "s3" or not uri.has_object():
+		raise ParameterError("Expecting S3 URI instead of '%s'" % uri_arg)
+
+	destination = len(args) > 0 and args.pop(0) or uri.object()
+	if os.path.isdir(destination):
+		destination += ("/" + uri.object())
+	if not Config().force and os.path.exists(destination):
+		raise ParameterError("File %s already exists. Use --force to overwrite it" % destination)
+	response = s3.object_get_uri(destination, uri)
+	output("Object %s saved as '%s' (%d bytes)" %
+		(uri, destination, response["size"]))
+
+def cmd_object_del(args):
+	s3 = S3(Config())
+
+	uri_arg = args.pop(0)
+	uri = S3Uri(uri_arg)
+	if uri.type != "s3" or not uri.has_object():
+		raise ParameterError("Expecting S3 URI instead of '%s'" % uri_arg)
+
+	response = s3.object_delete_uri(uri)
+	output("Object %s deleted" % uri)
+
+def run_configure(config_file):
+	cfg = Config()
+	options = [
+		("access_key", "Access Key"),
+		("secret_key", "Secret Key"),
+		]
+	try:
+		while 1:
+			output("\nEnter new values or accept defaults in brackets with Enter.")
+			output("Refer to user manual for detailed description of all options.\n")
+			for option in options:
+				prompt = option[1]
+				try:
+					val = getattr(cfg, option[0])
+					if val not in (None, ""):
+						prompt += " [%s]" % val
+				except AttributeError:
+					pass
+
+				if len(option) >= 3:
+					output("%s" % option[2])
+
+				val = raw_input(prompt + ": ")
+				if val != "":
+					setattr(cfg, option[0], val)
+			output("\nNew settings:")
+			for option in options:
+				output("  %s: %s" % (option[1], getattr(cfg, option[0])))
+			val = raw_input("\nChange any setting? [y/N] ")
+			if not val.lower().startswith("y"):
+				break
+		f = open(config_file, "w")
+		cfg.dump_config(f)
+		f.close()
+		output("Configuration saved to '%s'" % config_file)
+
+	except (EOFError, KeyboardInterrupt):
+		output("\nConfiguration aborted. Changes were NOT saved.")
+		return
+	
+	except IOError, e:
+		error("Writing config file failed: %s: %s" % (config_file, e.strerror))
+		sys.exit(1)
+
+commands = {}
+commands_list = [
+	{"cmd":"mb", "label":"Make bucket", "param":"s3://BUCKET", "func":cmd_bucket_create, "argc":1},
+	{"cmd":"rb", "label":"Remove bucket", "param":"s3://BUCKET", "func":cmd_bucket_delete, "argc":1},
+	{"cmd":"ls", "label":"List objects or buckets", "param":"[s3://BUCKET[/PREFIX]]", "func":cmd_ls, "argc":0},
+	{"cmd":"la", "label":"List all object in all buckets", "param":"", "func":cmd_buckets_list_all_all, "argc":0},
+	{"cmd":"put", "label":"Put file into bucket", "param":"FILE [FILE...] s3://BUCKET[/PREFIX]", "func":cmd_object_put, "argc":2},
+	{"cmd":"get", "label":"Get file from bucket", "param":"s3://BUCKET/OBJECT LOCAL_FILE", "func":cmd_object_get, "argc":1},
+	{"cmd":"del", "label":"Delete file from bucket", "param":"s3://BUCKET/OBJECT", "func":cmd_object_del, "argc":1},
+	]
+
+def format_commands(progname):
+	help = "Commands:\n"
+	for cmd in commands_list:
+		help += "  %s\n      %s %s %s\n" % (cmd["label"], progname, cmd["cmd"], cmd["param"])
+	return help
+
+class OptionMimeType(Option):
+	def check_mimetype(option, opt, value):
+		if re.compile("^[a-z0-9]+/[a-z0-9+\.-]+$", re.IGNORECASE).match(value):
+			return value
+		raise OptionValueError("option %s: invalid MIME-Type format: %r" % (opt, value))
+
+	TYPES = Option.TYPES + ("mimetype",)
+	TYPE_CHECKER = copy(Option.TYPE_CHECKER)
+	TYPE_CHECKER["mimetype"] = check_mimetype
+
+class MyHelpFormatter(IndentedHelpFormatter):
+	def format_epilog(self, epilog):
+		if epilog:
+			return "\n" + epilog + "\n"
+		else:
+			return ""
+
+if __name__ == '__main__':
+	if float("%d.%d" %(sys.version_info[0], sys.version_info[1])) < 2.4:
+		sys.stderr.write("ERROR: Python 2.4 or higher required, sorry.\n")
+		sys.exit(1)
+
+	## Populate "commands" from "commands_list"
+	for cmd in commands_list:
+		if cmd.has_key("cmd"):
+			commands[cmd["cmd"]] = cmd
+
+	default_verbosity = Config().verbosity
+	optparser = OptionParser(option_class=OptionMimeType, formatter=MyHelpFormatter())
+	#optparser.disable_interspersed_args()
+	optparser.set_defaults(config=os.getenv("HOME")+"/.s3cfg")
+	optparser.add_option("-c", "--config", dest="config", metavar="FILE", help="Config file name. Defaults to %default")
+	optparser.set_defaults(verbosity = default_verbosity)
+	optparser.add_option("-d", "--debug", dest="verbosity", action="store_const", const=logging.DEBUG, help="Enable debug output.")
+	optparser.add_option("-v", "--verbose", dest="verbosity", action="store_const", const=logging.INFO, help="Enable verbose output.")
+	optparser.add_option("-H", "--human-readable-sizes", dest="human_readable_sizes", action="store_true", help="Print sizes in human readable form.")
+	optparser.add_option("-f", "--force", dest="force", action="store_true", help="Force overwrite and other dangerous operations.")
+	optparser.add_option("-u", "--show-uri", dest="show_uri", action="store_true", help="Show complete S3 URI in listings.")
+	optparser.add_option("-P", "--acl-public", dest="acl_public", action="store_true", help="Store objects with ACL allowing read by anyone.")
+	optparser.add_option("-m", "--mime-type", dest="default_mime_type", type="mimetype", metavar="MIME/TYPE", help="Default MIME-type to be set for objects stored.")
+	optparser.add_option("-M", "--guess-mime-type", dest="guess_mime_type", action="store_true", help="Guess MIME-type of files by their extension. Falls back to default MIME-Type as specified by --mime-type option")
+	optparser.add_option(      "--dump-config", dest="dump_config", action="store_true", help="Dump current configuration after parsin config files and command line options and exit.")
+	optparser.add_option(      "--configure", dest="run_configure", action="store_true", help="Invoke interactive (re)configuration tool.")
+
+	optparser.set_usage(optparser.usage + " COMMAND [parameters]")
+	optparser.set_description('S3cmd is a tool to manage objects in '+
+		'Amazon S3 storage. It allows for making and removing '+
+		'"buckets" and uploading, downloading and removing '+
+		'"objects" from these buckets.')
+	optparser.epilog = format_commands(optparser.get_prog_name())
+	optparser.epilog += '\nSee program homepage for more information at\nhttp://www.logix.cz/michal/devel/s3tools\n'
+
+	(options, args) = optparser.parse_args()
+
+	## Some mucking with logging levels to enable 
+	## debugging/verbose output for config file parser on request
+	logging.basicConfig(level=options.verbosity, format='%(levelname)s: %(message)s')
+	
+	## Now finally parse the config file
+	try:
+		cfg = Config(options.config)
+	except IOError, e:
+		if options.run_configure:
+			cfg = Config()
+		else:
+			error("%s: %s"  % (options.config, e.strerror))
+			error("Configuration file not available.")
+			error("Consider using --configure parameter to create one.")
+			sys.exit(1)
+
+	## And again some logging level adjustments
+	## according to configfile and command line parameters
+	if options.verbosity != default_verbosity:
+		cfg.verbosity = options.verbosity
+	logging.root.setLevel(cfg.verbosity)
+
+	## Update Config with other parameters
+	for option in cfg.option_list():
+		try:
+			if getattr(options, option) != None:
+				debug("Updating %s -> %s" % (option, getattr(options, option)))
+				cfg.update_option(option, getattr(options, option))
+		except AttributeError:
+			## Some Config() options are not settable from command line
+			pass
+
+	if options.dump_config:
+		cfg.dump_config(sys.stdout)
+		sys.exit(0)
+
+	if options.run_configure:
+		run_configure(options.config)
+		sys.exit(0)
+
+	if len(args) < 1:
+		error("Missing command. Please run with --help for more information.")
+		sys.exit(1)
+
+	command = args.pop(0)
+	try:
+		debug("Command: " + commands[command]["cmd"])
+		## We must do this lookup in extra step to 
+		## avoid catching all KeyError exceptions
+		## from inner functions.
+		cmd_func = commands[command]["func"]
+	except KeyError, e:
+		error("Invalid command: %s" % e)
+		sys.exit(1)
+
+	if len(args) < commands[command]["argc"]:
+		error("Not enough paramters for command '%s'" % command)
+		sys.exit(1)
+
+	try:
+		cmd_func(args)
+	except S3Error, e:
+		error("S3 error: " + str(e))
+	except ParameterError, e:
+		error("Parameter problem: " + str(e))
+
+
